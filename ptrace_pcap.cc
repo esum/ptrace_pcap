@@ -17,6 +17,9 @@
 #include <unordered_map>
 #include <vector>
 
+constexpr unsigned short default_dst_port = 2321;
+constexpr unsigned short default_src_port = 50000;
+
 
 typedef union {
 	long l;
@@ -68,11 +71,22 @@ inline void write_ethernet_header(int fd, char const *dst_mac, char const *src_m
 	write(fd, &type, 2);
 }
 
+inline void write_ip4_header(int fd, struct in_addr *src_addr, struct in_addr *dst_addr, unsigned short total_length)
+{
+	unsigned short len = htons(total_length);
+	unsigned int src = htonl(src_addr->s_addr);
+	unsigned int dst = htonl(dst_addr->s_addr);
+	write(fd, "\x45\x00", 2);
+	write(fd, &len, 2);
+	write(fd, "\x00\x00" "\x00\x00" "\x00" "\x06" "\x00\x00", 8);
+	write(fd, &src, 4);
+	write(fd, &dst, 4);
+}
+
 inline void write_ip6_header(int fd, struct in6_addr *src_addr, struct in6_addr *dst_addr, unsigned short payload_length)
 {
-	unsigned short len;
+	unsigned short len = htons(payload_length);
 	write(fd, "\x60\x00\x00\x00", 4);
-	len = htons(payload_length);
 	write(fd, &len, 2);
 	write(fd, "\x06\x00", 2);
 	write(fd, src_addr->s6_addr, 16);
@@ -125,83 +139,112 @@ int main(int argc, char *argv[])
 			ptrace(PTRACE_GETREGS, pid, NULL, &regs);
 			switch (regs.orig_rax) {
 				case __NR_read: {
-					char *buffer = new char[regs.rdx + sizeof(long)];
-					struct in6_addr src_addr, dst_addr;
+					if (regs.rax > 0x7fffffffffff)
+						break;
+					char *buffer = new char[regs.rax + sizeof(long)];
+					bool ip4 = cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 4;
 					if (!seq_in.contains(regs.rdi))
 						seq_in[regs.rdi] = 0;
 					if (!seq_out.contains(regs.rdi))
 						seq_out[regs.rdi] = 0;
-					memset(&dst_addr, 0, sizeof(struct in6_addr));
-					if (cur_addr.contains(regs.rdi)) {
-						for (int i = 0; i < 16; i++)
-							src_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+					peek_data(pid, (void*)regs.rsi, buffer, regs.rax);
+					write_pcap_packet_header(dump, regs.rax + 14 + (ip4 ? 20 : 40) + 20);
+					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x01", "\x00\x00\x00\x00\x00\x02", ip4 ? 0x0800 : 0x86dd);
+					if (ip4) {
+						struct in_addr src_addr, dst_addr;
+						memset(&dst_addr, 0, sizeof(struct in_addr));
+						src_addr.s_addr = (cur_addr[regs.rdi].first[0] << 24) | (cur_addr[regs.rdi].first[1] << 16) | (cur_addr[regs.rdi].first[2] << 8) | cur_addr[regs.rdi].first[3];
+						write_ip4_header(dump, &src_addr, &dst_addr, regs.rax + 20 + 20);
 					}
 					else {
-						memset(&src_addr, 0, sizeof(struct in6_addr));
-						src_addr.s6_addr[0] = 1;
-						src_addr.s6_addr[15] = regs.rdi;
+						struct in6_addr src_addr, dst_addr;
+						memset(&dst_addr, 0, sizeof(struct in6_addr));
+						if (cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 16) {
+							for (int i = 0; i < 16; i++)
+								src_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+						}
+						else {
+							memset(&src_addr, 0, sizeof(struct in6_addr));
+							src_addr.s6_addr[0] = 1;
+							src_addr.s6_addr[15] = regs.rdi;
+						}
+						write_ip6_header(dump, &src_addr, &dst_addr, regs.rax + 20);
 					}
-					peek_data(pid, (void*)regs.rsi, buffer, regs.rdx);
-					write_pcap_packet_header(dump, regs.rdx + 14 + 40 + 20);
-					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x01", "\x00\x00\x00\x00\x00\x02", 0x86dd);
-					write_ip6_header(dump, &src_addr, &dst_addr, regs.rdx + 20);
 					if (last_syscall.contains(regs.rdi) && last_syscall[regs.rdi] != regs.orig_rax)
-						write_tcp_header(dump, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : 22, 50000, seq_in[regs.rdi], seq_out[regs.rdi], 16);
+						write_tcp_header(dump, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, default_src_port, seq_in[regs.rdi], seq_out[regs.rdi], 16);
 					else
-						write_tcp_header(dump, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : 22, 50000, seq_in[regs.rdi], 0, 0);
-					write(dump, buffer, regs.rdx);
-					seq_in[regs.rdi] += regs.rdx;
+						write_tcp_header(dump, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, default_src_port, seq_in[regs.rdi], 0, 0);
+					write(dump, buffer, regs.rax);
+					seq_in[regs.rdi] += regs.rax;
 					last_syscall[regs.rdi] = regs.orig_rax;
 					delete[] buffer;
 					}
 					break;
 				case __NR_write: {
-					char *buffer = new char[regs.rdx + sizeof(long)];
-					struct in6_addr src_addr, dst_addr;
+					char *buffer = new char[regs.rax + sizeof(long)];
+					bool ip4 = cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 4;
 					if (!seq_in.contains(regs.rdi))
 						seq_in[regs.rdi] = 0;
 					if (!seq_out.contains(regs.rdi))
 						seq_out[regs.rdi] = 0;
-					memset(&src_addr, 0, sizeof(struct in6_addr));
-					if (cur_addr.contains(regs.rdi)) {
-						for (int i = 0; i < 16; i++)
-							dst_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+					peek_data(pid, (void*)regs.rsi, buffer, regs.rax);
+					write_pcap_packet_header(dump, regs.rax + 14 + (ip4 ? 20 : 40) + 20);
+					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x02", "\x00\x00\x00\x00\x00\x01", ip4 ? 0x0800 : 0x86dd);
+					if (ip4) {
+						struct in_addr src_addr, dst_addr;
+						memset(&src_addr, 0, sizeof(struct in_addr));
+						dst_addr.s_addr = (cur_addr[regs.rdi].first[0] << 24) | (cur_addr[regs.rdi].first[1] << 16) | (cur_addr[regs.rdi].first[2] << 8) | cur_addr[regs.rdi].first[3];
+						write_ip4_header(dump, &src_addr, &dst_addr, regs.rax + 20 + 20);
 					}
 					else {
-						memset(&dst_addr, 0, sizeof(struct in6_addr));
-						dst_addr.s6_addr[0] = 1;
-						dst_addr.s6_addr[15] = regs.rdi;
+						struct in6_addr src_addr, dst_addr;
+						memset(&src_addr, 0, sizeof(struct in6_addr));
+						if (cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 16) {
+							for (int i = 0; i < 16; i++)
+								dst_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+						}
+						else {
+							memset(&dst_addr, 0, sizeof(struct in6_addr));
+							dst_addr.s6_addr[0] = 1;
+							dst_addr.s6_addr[15] = regs.rdi;
+						}
+						write_ip6_header(dump, &src_addr, &dst_addr, regs.rax + 20);
 					}
-					peek_data(pid, (void*)regs.rsi, buffer, regs.rdx);
-					write_pcap_packet_header(dump, regs.rdx + 14 + 40 + 20);
-					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x02", "\x00\x00\x00\x00\x00\x01", 0x86dd);
-					write_ip6_header(dump, &src_addr, &dst_addr, regs.rdx + 20);
 					if (last_syscall.contains(regs.rdi) && last_syscall[regs.rdi] != regs.orig_rax)
-						write_tcp_header(dump, 50000, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : 22, seq_out[regs.rdi], seq_in[regs.rdi], 16);
+						write_tcp_header(dump, default_src_port, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], seq_in[regs.rdi], 16);
 					else
-						write_tcp_header(dump, 50000, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : 22, seq_out[regs.rdi], 0, 0);
-					write(dump, buffer, regs.rdx);
-					seq_out[regs.rdi] += regs.rdx;
+						write_tcp_header(dump, default_src_port, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], 0, 0);
+					write(dump, buffer, regs.rax);
+					seq_out[regs.rdi] += regs.rax;
 					last_syscall[regs.rdi] = regs.orig_rax;
 					delete[] buffer;
 					}
 					break;
 				case __NR_close: {
-					struct in6_addr src_addr, dst_addr;
-					memset(&dst_addr, 0, sizeof(struct in6_addr));
-					if (cur_addr.contains(regs.rdi)) {
-						for (int i = 0; i < 16; i++)
-							src_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+					bool ip4 = cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 4;
+					write_pcap_packet_header(dump, 14 + (ip4 ? 20 : 40) + 20);
+					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x02", "\x00\x00\x00\x00\x00\x01", ip4 ? 0x0800 : 0x86dd);
+					if (ip4) {
+						struct in_addr src_addr, dst_addr;
+						memset(&src_addr, 0, sizeof(struct in_addr));
+						dst_addr.s_addr = (cur_addr[regs.rdi].first[0] << 24) | (cur_addr[regs.rdi].first[1] << 16) | (cur_addr[regs.rdi].first[2] << 8) | cur_addr[regs.rdi].first[3];
+						write_ip4_header(dump, &src_addr, &dst_addr, regs.rax + 20 + 20);
 					}
 					else {
+						struct in6_addr src_addr, dst_addr;
 						memset(&src_addr, 0, sizeof(struct in6_addr));
-						src_addr.s6_addr[0] = 1;
-						src_addr.s6_addr[15] = regs.rdi;
+						if (cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 16) {
+							for (int i = 0; i < 16; i++)
+								dst_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+						}
+						else {
+							memset(&dst_addr, 0, sizeof(struct in6_addr));
+							dst_addr.s6_addr[0] = 1;
+							dst_addr.s6_addr[15] = regs.rdi;
+						}
+						write_ip6_header(dump, &src_addr, &dst_addr, 20);
 					}
-					write_pcap_packet_header(dump, 14 + 40 + 20);
-					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x02", "\x00\x00\x00\x00\x00\x01", 0x86dd);
-					write_ip6_header(dump, &src_addr, &dst_addr, 20);
-					write_tcp_header(dump, 50000, 22, seq_out[regs.rdi], seq_in[regs.rdi], 4);
+					write_tcp_header(dump, default_src_port, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], seq_in[regs.rdi], 4);
 					seq_in[regs.rdi] = 0;
 					seq_out[regs.rdi] = 0;
 					last_syscall[regs.rdi] = regs.orig_rax;
@@ -213,11 +256,15 @@ int main(int argc, char *argv[])
 					char *buffer = new char[regs.rdx + sizeof(long)];
 					peek_data(pid, (void*)regs.rsi, buffer, regs.rdx);
 					switch (((struct sockaddr*)buffer)->sa_family) {
-						/* case AF_INET: {
+						case AF_INET: {
 							struct sockaddr_in *addr = (struct sockaddr_in*)buffer;
-							cur_addr[regs.rdi] = { {}, addr->sin_port };
+							cur_addr[regs.rdi] = { {}, ntohs(addr->sin_port) };
+							cur_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0xff000000) >> 24);
+							cur_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x00ff0000) >> 16);
+							cur_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x0000ff00) >> 8);
+							cur_addr[regs.rdi].first.push_back(ntohl(addr->sin_addr.s_addr) & 0x000000ff);
 							}
-							break; */
+							break;
 						case AF_INET6: {
 							struct sockaddr_in6 *addr = (struct sockaddr_in6*)buffer;
 							cur_addr[regs.rdi] = { {}, ntohs(addr->sin6_port) };
