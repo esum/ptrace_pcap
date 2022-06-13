@@ -10,10 +10,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <time.h>
 #include <unistd.h>
 
-//#include <queue>
 #include <unordered_map>
 #include <vector>
 
@@ -119,15 +119,18 @@ int main(int argc, char *argv[])
 			return 1;
 		int status;
 		bool cont = false;
-		//std::unordered_map<int, std::queue<std::tuple<std::optional<struct sockaddr>, bool, char*>>> buffer_data;
 		int dump = open(argv[1], O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IWUSR);
 		if (dump == -1) {
 			return 1;
 		}
+		std::random_device rd;
+		std::mt19937 mt(rd());
 		std::unordered_map<int, unsigned int> seq_in;
 		std::unordered_map<int, unsigned int> seq_out;
 		std::unordered_map<int, unsigned long> last_syscall;
-		std::unordered_map<int, std::pair<std::vector<unsigned char>, unsigned short>> cur_addr;
+		std::unordered_map<int, std::pair<std::vector<unsigned char>, unsigned short>> cur_remote_addr;
+		std::unordered_map<int, std::pair<std::vector<unsigned char>, unsigned short>> cur_local_addr;
+		std::unordered_map<int, std::pair<std::vector<unsigned char>, unsigned short>> binds;
 		write_pcap_header(dump);
 		while (waitpid(pid, &status, 0) && !WIFEXITED(status)) {
 			struct user_regs_struct regs;
@@ -142,26 +145,32 @@ int main(int argc, char *argv[])
 					if (regs.rax > 0x7fffffffffff)
 						break;
 					char *buffer = new char[regs.rax + sizeof(long)];
-					bool ip4 = cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 4;
+					bool ip4 = cur_remote_addr.contains(regs.rdi) && cur_remote_addr[regs.rdi].first.size() == 4 || cur_local_addr.contains(regs.rdi) && cur_local_addr[regs.rdi].first.size() == 4;
 					if (!seq_in.contains(regs.rdi))
-						seq_in[regs.rdi] = 0;
+						seq_in[regs.rdi] = mt();
 					if (!seq_out.contains(regs.rdi))
-						seq_out[regs.rdi] = 0;
+						seq_out[regs.rdi] = mt();
 					peek_data(pid, (void*)regs.rsi, buffer, regs.rax);
 					write_pcap_packet_header(dump, regs.rax + 14 + (ip4 ? 20 : 40) + 20);
 					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x01", "\x00\x00\x00\x00\x00\x02", ip4 ? 0x0800 : 0x86dd);
 					if (ip4) {
 						struct in_addr src_addr, dst_addr;
-						memset(&dst_addr, 0, sizeof(struct in_addr));
-						src_addr.s_addr = (cur_addr[regs.rdi].first[0] << 24) | (cur_addr[regs.rdi].first[1] << 16) | (cur_addr[regs.rdi].first[2] << 8) | cur_addr[regs.rdi].first[3];
+						if (cur_local_addr.contains(regs.rdi))
+							dst_addr.s_addr = (cur_local_addr[regs.rdi].first[0] << 24) | (cur_local_addr[regs.rdi].first[1] << 16) | (cur_local_addr[regs.rdi].first[2] << 8) | cur_local_addr[regs.rdi].first[3];
+						else
+							memset(&dst_addr, 0, sizeof(struct in_addr));
+						if (cur_remote_addr.contains(regs.rdi))
+							src_addr.s_addr = (cur_remote_addr[regs.rdi].first[0] << 24) | (cur_remote_addr[regs.rdi].first[1] << 16) | (cur_remote_addr[regs.rdi].first[2] << 8) | cur_remote_addr[regs.rdi].first[3];
+						else
+							memset(&src_addr, 0, sizeof(struct in_addr));
 						write_ip4_header(dump, &src_addr, &dst_addr, regs.rax + 20 + 20);
 					}
 					else {
 						struct in6_addr src_addr, dst_addr;
 						memset(&dst_addr, 0, sizeof(struct in6_addr));
-						if (cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 16) {
+						if (cur_remote_addr.contains(regs.rdi) && cur_remote_addr[regs.rdi].first.size() == 16) {
 							for (int i = 0; i < 16; i++)
-								src_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+								src_addr.s6_addr[i] = cur_remote_addr[regs.rdi].first[i];
 						}
 						else {
 							memset(&src_addr, 0, sizeof(struct in6_addr));
@@ -171,9 +180,9 @@ int main(int argc, char *argv[])
 						write_ip6_header(dump, &src_addr, &dst_addr, regs.rax + 20);
 					}
 					if (last_syscall.contains(regs.rdi) && last_syscall[regs.rdi] != regs.orig_rax)
-						write_tcp_header(dump, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, default_src_port, seq_in[regs.rdi], seq_out[regs.rdi], 16);
+						write_tcp_header(dump, cur_remote_addr.contains(regs.rdi) ? cur_remote_addr[regs.rdi].second : default_dst_port, cur_local_addr.contains(regs.rdi) ? cur_local_addr[regs.rdi].second : default_src_port, seq_in[regs.rdi], seq_out[regs.rdi], 16);
 					else
-						write_tcp_header(dump, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, default_src_port, seq_in[regs.rdi], 0, 0);
+						write_tcp_header(dump, cur_remote_addr.contains(regs.rdi) ? cur_remote_addr[regs.rdi].second : default_dst_port, cur_local_addr.contains(regs.rdi) ? cur_local_addr[regs.rdi].second : default_src_port, seq_in[regs.rdi], 0, 0);
 					write(dump, buffer, regs.rax);
 					seq_in[regs.rdi] += regs.rax;
 					last_syscall[regs.rdi] = regs.orig_rax;
@@ -181,27 +190,29 @@ int main(int argc, char *argv[])
 					}
 					break;
 				case __NR_write: {
+					if (regs.rax > 0x7fffffffffff)
+						break;
 					char *buffer = new char[regs.rax + sizeof(long)];
-					bool ip4 = cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 4;
+					bool ip4 = cur_remote_addr.contains(regs.rdi) && cur_remote_addr[regs.rdi].first.size() == 4;
 					if (!seq_in.contains(regs.rdi))
-						seq_in[regs.rdi] = 0;
+						seq_in[regs.rdi] = mt();
 					if (!seq_out.contains(regs.rdi))
-						seq_out[regs.rdi] = 0;
+						seq_out[regs.rdi] = mt();
 					peek_data(pid, (void*)regs.rsi, buffer, regs.rax);
 					write_pcap_packet_header(dump, regs.rax + 14 + (ip4 ? 20 : 40) + 20);
 					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x02", "\x00\x00\x00\x00\x00\x01", ip4 ? 0x0800 : 0x86dd);
 					if (ip4) {
 						struct in_addr src_addr, dst_addr;
 						memset(&src_addr, 0, sizeof(struct in_addr));
-						dst_addr.s_addr = (cur_addr[regs.rdi].first[0] << 24) | (cur_addr[regs.rdi].first[1] << 16) | (cur_addr[regs.rdi].first[2] << 8) | cur_addr[regs.rdi].first[3];
+						dst_addr.s_addr = (cur_remote_addr[regs.rdi].first[0] << 24) | (cur_remote_addr[regs.rdi].first[1] << 16) | (cur_remote_addr[regs.rdi].first[2] << 8) | cur_remote_addr[regs.rdi].first[3];
 						write_ip4_header(dump, &src_addr, &dst_addr, regs.rax + 20 + 20);
 					}
 					else {
 						struct in6_addr src_addr, dst_addr;
 						memset(&src_addr, 0, sizeof(struct in6_addr));
-						if (cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 16) {
+						if (cur_remote_addr.contains(regs.rdi) && cur_remote_addr[regs.rdi].first.size() == 16) {
 							for (int i = 0; i < 16; i++)
-								dst_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+								dst_addr.s6_addr[i] = cur_remote_addr[regs.rdi].first[i];
 						}
 						else {
 							memset(&dst_addr, 0, sizeof(struct in6_addr));
@@ -211,9 +222,9 @@ int main(int argc, char *argv[])
 						write_ip6_header(dump, &src_addr, &dst_addr, regs.rax + 20);
 					}
 					if (last_syscall.contains(regs.rdi) && last_syscall[regs.rdi] != regs.orig_rax)
-						write_tcp_header(dump, default_src_port, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], seq_in[regs.rdi], 16);
+						write_tcp_header(dump, default_src_port, cur_remote_addr.contains(regs.rdi) ? cur_remote_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], seq_in[regs.rdi], 16);
 					else
-						write_tcp_header(dump, default_src_port, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], 0, 0);
+						write_tcp_header(dump, default_src_port, cur_remote_addr.contains(regs.rdi) ? cur_remote_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], 0, 0);
 					write(dump, buffer, regs.rax);
 					seq_out[regs.rdi] += regs.rax;
 					last_syscall[regs.rdi] = regs.orig_rax;
@@ -221,21 +232,29 @@ int main(int argc, char *argv[])
 					}
 					break;
 				case __NR_close: {
-					bool ip4 = cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 4;
+					if (regs.rax > 0x7fffffffffff)
+						break;
+					bool ip4 = cur_remote_addr.contains(regs.rdi) && cur_remote_addr[regs.rdi].first.size() == 4 || cur_local_addr.contains(regs.rdi) && cur_local_addr[regs.rdi].first.size() == 4;
 					write_pcap_packet_header(dump, 14 + (ip4 ? 20 : 40) + 20);
 					write_ethernet_header(dump, "\x00\x00\x00\x00\x00\x02", "\x00\x00\x00\x00\x00\x01", ip4 ? 0x0800 : 0x86dd);
 					if (ip4) {
 						struct in_addr src_addr, dst_addr;
-						memset(&src_addr, 0, sizeof(struct in_addr));
-						dst_addr.s_addr = (cur_addr[regs.rdi].first[0] << 24) | (cur_addr[regs.rdi].first[1] << 16) | (cur_addr[regs.rdi].first[2] << 8) | cur_addr[regs.rdi].first[3];
+						if (cur_local_addr.contains(regs.rdi))
+							src_addr.s_addr = (cur_local_addr[regs.rdi].first[0] << 24) | (cur_local_addr[regs.rdi].first[1] << 16) | (cur_local_addr[regs.rdi].first[2] << 8) | cur_local_addr[regs.rdi].first[3];
+						else
+							memset(&src_addr, 0, sizeof(struct in_addr));
+						if (cur_remote_addr.contains(regs.rdi))
+							dst_addr.s_addr = (cur_remote_addr[regs.rdi].first[0] << 24) | (cur_remote_addr[regs.rdi].first[1] << 16) | (cur_remote_addr[regs.rdi].first[2] << 8) | cur_remote_addr[regs.rdi].first[3];
+						else
+							memset(&dst_addr, 0, sizeof(struct in_addr));
 						write_ip4_header(dump, &src_addr, &dst_addr, regs.rax + 20 + 20);
 					}
 					else {
 						struct in6_addr src_addr, dst_addr;
 						memset(&src_addr, 0, sizeof(struct in6_addr));
-						if (cur_addr.contains(regs.rdi) && cur_addr[regs.rdi].first.size() == 16) {
+						if (cur_remote_addr.contains(regs.rdi) && cur_remote_addr[regs.rdi].first.size() == 16) {
 							for (int i = 0; i < 16; i++)
-								dst_addr.s6_addr[i] = cur_addr[regs.rdi].first[i];
+								dst_addr.s6_addr[i] = cur_remote_addr[regs.rdi].first[i];
 						}
 						else {
 							memset(&dst_addr, 0, sizeof(struct in6_addr));
@@ -244,33 +263,102 @@ int main(int argc, char *argv[])
 						}
 						write_ip6_header(dump, &src_addr, &dst_addr, 20);
 					}
-					write_tcp_header(dump, default_src_port, cur_addr.contains(regs.rdi) ? cur_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], seq_in[regs.rdi], 4);
-					seq_in[regs.rdi] = 0;
-					seq_out[regs.rdi] = 0;
+					write_tcp_header(dump, cur_local_addr.contains(regs.rdi) ? cur_local_addr[regs.rdi].second : default_src_port, cur_remote_addr.contains(regs.rdi) ? cur_remote_addr[regs.rdi].second : default_dst_port, seq_out[regs.rdi], seq_in[regs.rdi], 4);
+					if (seq_in.contains(regs.rdi))
+						seq_in.erase(regs.rdi);
+					if (seq_out.contains(regs.rdi))
+						seq_out.erase(regs.rdi);
+					seq_out[regs.rdi] = mt();
 					last_syscall[regs.rdi] = regs.orig_rax;
-					if (cur_addr.contains(regs.rdi))
-						cur_addr.erase(regs.rdi);
+					if (cur_remote_addr.contains(regs.rdi))
+						cur_remote_addr.erase(regs.rdi);
+					if (cur_local_addr.contains(regs.rdi))
+						cur_local_addr.erase(regs.rdi);
+					if (binds.contains(regs.rdi))
+						binds.erase(regs.rdi);
 					}
 					break;
 				case __NR_connect: {
+					if (regs.rax > 0x7fffffffffff)
+						break;
 					char *buffer = new char[regs.rdx + sizeof(long)];
 					peek_data(pid, (void*)regs.rsi, buffer, regs.rdx);
 					switch (((struct sockaddr*)buffer)->sa_family) {
 						case AF_INET: {
 							struct sockaddr_in *addr = (struct sockaddr_in*)buffer;
-							cur_addr[regs.rdi] = { {}, ntohs(addr->sin_port) };
-							cur_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0xff000000) >> 24);
-							cur_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x00ff0000) >> 16);
-							cur_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x0000ff00) >> 8);
-							cur_addr[regs.rdi].first.push_back(ntohl(addr->sin_addr.s_addr) & 0x000000ff);
+							cur_remote_addr[regs.rdi] = { {}, ntohs(addr->sin_port) };
+							cur_remote_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0xff000000) >> 24);
+							cur_remote_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x00ff0000) >> 16);
+							cur_remote_addr[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x0000ff00) >> 8);
+							cur_remote_addr[regs.rdi].first.push_back(ntohl(addr->sin_addr.s_addr) & 0x000000ff);
 							}
 							break;
 						case AF_INET6: {
 							struct sockaddr_in6 *addr = (struct sockaddr_in6*)buffer;
-							cur_addr[regs.rdi] = { {}, ntohs(addr->sin6_port) };
-							for (int i = 0; i < 16; i++) {
-								cur_addr[regs.rdi].first.push_back(addr->sin6_addr.s6_addr[i]);
+							cur_remote_addr[regs.rdi] = { {}, ntohs(addr->sin6_port) };
+							for (int i = 0; i < 16; i++)
+								cur_remote_addr[regs.rdi].first.push_back(addr->sin6_addr.s6_addr[i]);
 							}
+							break;
+						default:
+							break;
+					}
+					delete[] buffer;
+					}
+					break;
+				case __NR_accept:
+				case __NR_accept4: {
+					if (regs.rax > 0x7fffffffffff)
+						break;
+					socklen_t *socklen = new socklen_t;
+					peek_data(pid, (void*)regs.rdx, (char*)socklen, sizeof(socklen_t));
+					char *buffer = new char[*socklen + sizeof(long)];
+					peek_data(pid, (void*)regs.rsi, buffer, *socklen);
+					switch (((struct sockaddr*)buffer)->sa_family) {
+						case AF_INET: {
+							struct sockaddr_in *addr = (struct sockaddr_in*)buffer;
+							cur_remote_addr[regs.rax] = { {}, ntohs(addr->sin_port) };
+							cur_remote_addr[regs.rax].first.push_back((ntohl(addr->sin_addr.s_addr) & 0xff000000) >> 24);
+							cur_remote_addr[regs.rax].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x00ff0000) >> 16);
+							cur_remote_addr[regs.rax].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x0000ff00) >> 8);
+							cur_remote_addr[regs.rax].first.push_back(ntohl(addr->sin_addr.s_addr) & 0x000000ff);
+							}
+							break;
+						case AF_INET6: {
+							struct sockaddr_in6 *addr = (struct sockaddr_in6*)buffer;
+							cur_remote_addr[regs.rax] = { {}, ntohs(addr->sin6_port) };
+							for (int i = 0; i < 16; i++)
+								cur_remote_addr[regs.rax].first.push_back(addr->sin6_addr.s6_addr[i]);
+							}
+							break;
+						default:
+							break;
+					}
+					delete[] buffer;
+					if (binds.contains(regs.rdi))
+						cur_local_addr[regs.rax] = binds[regs.rdi];
+					}
+					break;
+				case __NR_bind: {
+					if (regs.rax > 0x7fffffffffff)
+						break;
+					char *buffer = new char[regs.rdx + sizeof(long)];
+					peek_data(pid, (void*)regs.rsi, buffer, regs.rdx);
+					switch (((struct sockaddr*)buffer)->sa_family) {
+						case AF_INET: {
+							struct sockaddr_in *addr = (struct sockaddr_in*)buffer;
+							binds[regs.rdi] = { {}, ntohs(addr->sin_port) };
+							binds[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0xff000000) >> 24);
+							binds[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x00ff0000) >> 16);
+							binds[regs.rdi].first.push_back((ntohl(addr->sin_addr.s_addr) & 0x0000ff00) >> 8);
+							binds[regs.rdi].first.push_back(ntohl(addr->sin_addr.s_addr) & 0x000000ff);
+							}
+							break;
+						case AF_INET6: {
+							struct sockaddr_in6 *addr = (struct sockaddr_in6*)buffer;
+							binds[regs.rdi] = { {}, ntohs(addr->sin6_port) };
+							for (int i = 0; i < 16; i++)
+								binds[regs.rdi].first.push_back(addr->sin6_addr.s6_addr[i]);
 							}
 							break;
 						default:
